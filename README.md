@@ -1,7 +1,51 @@
-[README.md](https://github.com/user-attachments/files/32459747/README.md)
-# ShopSphere Backend API — Person C
+[HANDOFF.md](https://github.com/user-attachments/files/32459935/HANDOFF.md)
+# Person C → Person D
 
-## Setup (Day 3)
+## What I built
+
+A FastAPI server (`main.py`) exposing every endpoint from `api-contract.md`,
+plus a WebSocket for live updates. Right now (Week 1) every endpoint
+returns realistic **mock** data in the locked contract shape, so you can
+build the whole dashboard against it before the real pipeline exists.
+
+```
+GET  /api/revenue
+GET  /api/orders?limit=10
+GET  /api/active-users
+GET  /api/top-products?limit=5
+GET  /api/user-activity?product_id=...
+GET  /api/recommendations?product_id=...
+WS   /ws/live-updates
+```
+
+Auto-generated docs: `http://localhost:8000/docs` — open this to try every
+endpoint in the browser without writing any fetch code.
+
+## How each endpoint will map to real data (Week 2)
+
+Based on Person B's stream-processor doc, here's what's actually behind
+each endpoint once I swap the mocks for real queries — noting this now so
+nobody is surprised when values behave differently than the Week 1 mock:
+
+| Endpoint | Real source (Week 2) | Gotcha to know about |
+|---|---|---|
+| `/api/revenue` | Redis `orders:revenue_today` (INCRBYFLOAT) + `orders:count` | Redis value has float drift (e.g. `15876.39999999999999947`) — I round to 2 decimals server-side, so you'll always get a clean number from the API. You never need to round it yourself. |
+| `/api/orders` | MongoDB `orders` collection | Product names: only `P10`–`P19` have a name in the `products` lookup collection. The producer emits IDs up to roughly `P50`, so some orders will show a raw ID instead of a name — that's expected, not a bug on your end. |
+| `/api/active-users` | Redis `active_users` set (cardinality) | This is "sessions currently marked active," not a live websocket-connection count — don't expect it to move in real time between server pushes. |
+| `/api/top-products` | MongoDB aggregation over `orders` (count by `product_id`) | Same P10–P19 name-lookup limit as above applies here too. |
+| `/api/user-activity` | Cassandra `clicks` table (filtered by inferred product page) + Mongo orders count | `page` in Cassandra is a category label (`home`, `product_detail`, `cart`, `checkout`), not a URL — there's no direct `product_id` column on clicks yet, so per-product click counts are an approximation until B's schema adds one. Flagging this to B separately. |
+| `/api/recommendations` | Neo4j Cypher query (`BOUGHT` relationships) | This is real graph data, verified working — pass a `product_id` in the `P1x`–`P5x` range to get non-empty results. |
+| `/ws/live-updates` | Triggered by the stream processor as it consumes each Kafka event | In Week 1 this is a fake timer (`asyncio.sleep(3)`). In Week 2 it'll fire on actual events, so push frequency will become irregular (bursty) instead of a steady 3-second tick — don't build any UI animation that assumes a fixed interval. |
+
+**Important, from Person B's notes:** the `timestamp` field on every event is
+random fake data scattered across past and future years — do **not** build
+any "last hour" / "today" trend logic off it. Anything "live" on the
+dashboard is driven by *when the event was processed*, not that field. Your
+API responses already reflect current processing time (`as_of`, live
+WebSocket pushes), so just consume those as-is rather than the underlying
+`timestamp`.
+
+## How to run this locally
 
 ```bash
 cd backend-api
@@ -11,18 +55,10 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Open **http://localhost:8000/docs** — this is your auto-generated API
-documentation. Share this URL with Person D.
+Open `http://localhost:8000/docs` to confirm all 6 endpoints + the
+WebSocket are listed and respond.
 
-## What's already done (Day 4–6, in one file)
-
-- All 6 endpoints from `api-contract.md`, returning realistic mock JSON
-  in the exact shape the contract specifies.
-- `/ws/live-updates` WebSocket pushing a fake `new_order` event every 3
-  seconds.
-- CORS enabled so the React dev server can call this locally.
-
-## Test it manually
+Test manually:
 
 ```bash
 curl http://localhost:8000/api/revenue
@@ -33,34 +69,30 @@ curl "http://localhost:8000/api/user-activity?product_id=P-2003"
 curl "http://localhost:8000/api/recommendations?product_id=P-2003"
 ```
 
-For the WebSocket, easiest is the browser console on any page, or a tool
-like `websocat`:
+## Known issues / gotchas (read before debugging from scratch)
 
-```bash
-websocat ws://localhost:8000/ws/live-updates
-```
+- **CORS:** currently wide open (`allow_origins=["*"]`) so your dev server
+  can call this from any port. Tighten this before deployment (Week 4).
+- **Mock state resets on restart:** the in-memory counters (`revenue_today`,
+  `orders_today`, `active_users`) live in a plain Python dict, not a real
+  database — every `uvicorn --reload` restart resets them to the starting
+  values in `main.py`. This is fine for Week 1; it goes away once real
+  queries replace the mocks.
+- **Contract is the source of truth:** if any field name or response shape
+  in `main.py` doesn't match `api-contract.md`, the contract wins — flag it
+  to the team and update the file first, don't silently change either side.
+- **Week 2 dependency:** once I wire in real DB calls, this server needs
+  Kafka + Mongo + Cassandra + Redis + Neo4j running first (`docker compose
+  up -d` from the repo root, per B's doc) — the mock version you're using
+  now has zero external dependencies, which is why it's safe to build
+  against before that infra exists.
 
-## Day 7 — before the Week 1 sync
+## Confirmation checklist
 
-- [ ] Confirm `/docs` loads and every endpoint is listed
-- [ ] Demo the WebSocket pushing updates live
-- [ ] Double check every field name/type still matches `api-contract.md`
-      exactly — if you changed anything while building, update the
-      contract file FIRST and tell the team
-
-## Week 2 — swapping in real data
-
-Each endpoint function in `main.py` currently returns mock data. When
-Person B's databases are live, replace the body of each function with
-the real query — keep the function signature and returned dict shape
-identical so Person D's frontend never has to change.
-
-| Endpoint | Week 2 real source |
-|---|---|
-| `/api/revenue` | Redis (fast counter) or aggregate from Mongo |
-| `/api/orders` | MongoDB, most recent N orders |
-| `/api/active-users` | Redis counter |
-| `/api/top-products` | MongoDB aggregation or Cassandra |
-| `/api/user-activity` | Cassandra (click logs) + Mongo (orders) |
-| `/api/recommendations` | Neo4j Cypher query |
-| `/ws/live-updates` | Triggered by the stream processor (Person B) on each new Kafka event, instead of the `asyncio.sleep` loop |
+- [ ] `/docs` loads and lists all 6 endpoints + the WebSocket
+- [ ] Every response field name/type matches `api-contract.md` exactly
+- [ ] WebSocket pushes a `new_order` event visibly (tested via browser
+      console or `websocat ws://localhost:8000/ws/live-updates`)
+- [ ] Shared base URL + `/docs` link with Person D
+- [ ] Flagged the missing per-product click linkage in Cassandra to
+      Person B ahead of Week 2
