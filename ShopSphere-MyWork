@@ -1,1 +1,191 @@
 
+"""
+ShopSphere Backend API — Person C
+Week 1 goal: every endpoint from api-contract.md, returning realistic mock
+data with the EXACT shape the frontend (Person D) is building against.
+
+Week 2 goal: swap the mock data inside each function for real calls to
+Mongo / Cassandra / Redis / Neo4j (Person B's databases). The function
+signatures and response shapes below should NOT change when you do that —
+that's the whole point of locking the contract.
+
+Run it:
+    pip install -r requirements.txt
+    uvicorn main:app --reload --port 8000
+
+Then open http://localhost:8000/docs to see auto-generated API docs
+(share this URL with Person D).
+"""
+
+import asyncio
+import random
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="ShopSphere API", version="0.1.0")
+
+# Allow the React dev server (Person D, usually localhost:5173) to call this
+# API from the browser. Loosen/tighten origins later as needed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def now_iso() -> str:
+    """Timestamps must be ISO 8601 UTC per the contract's conventions."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# In-memory "state" so the mock numbers move around a bit and stay internally
+# consistent (e.g. active-users going up/down slightly on each call).
+# This is NOT persistence — it just resets when the server restarts, and it's
+# only here to make Week 1 demos feel alive. Real state comes from Redis/Mongo
+# etc. in Week 2.
+# ---------------------------------------------------------------------------
+_state = {
+    "revenue_today": 125400.00,
+    "orders_today": 542,
+    "active_users": 87,
+}
+
+_products = [
+    {"product_id": "P-2001", "name": "Laptop", "orders": 128},
+    {"product_id": "P-2003", "name": "Wireless Headphones", "orders": 96},
+    {"product_id": "P-2002", "name": "Phone", "orders": 84},
+    {"product_id": "P-2004", "name": "Bluetooth Speaker", "orders": 61},
+    {"product_id": "P-2005", "name": "Phone Stand", "orders": 40},
+]
+
+_product_names = {
+    "P-2001": "Laptop",
+    "P-2002": "Phone",
+    "P-2003": "Wireless Headphones",
+    "P-2004": "Bluetooth Speaker",
+    "P-2005": "Phone Stand",
+    "P-2006": "Phone Case",
+}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/revenue
+# ---------------------------------------------------------------------------
+@app.get("/api/revenue")
+def get_revenue():
+    return {
+        "revenue_today": round(_state["revenue_today"], 2),
+        "currency": "INR",
+        "orders_today": _state["orders_today"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/orders?limit=10
+# ---------------------------------------------------------------------------
+@app.get("/api/orders")
+def get_orders(limit: int = 10):
+    sample_products = [
+        ("Laptop", 45999.00),
+        ("Phone Case", 399.00),
+        ("Wireless Headphones", 2999.00),
+        ("Phone Stand", 599.00),
+        ("Phone", 24999.00),
+    ]
+    orders = []
+    for i in range(limit):
+        name, amount = random.choice(sample_products)
+        orders.append(
+            {
+                "order_id": f"ORD-{542 - i:05d}",
+                "product_name": name,
+                "amount": amount,
+                "status": "placed",
+                "timestamp": now_iso(),
+            }
+        )
+    return {"orders": orders}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/active-users
+# ---------------------------------------------------------------------------
+@app.get("/api/active-users")
+def get_active_users():
+    # small realistic jitter, like Redis counter moving in real time
+    _state["active_users"] = max(0, _state["active_users"] + random.randint(-2, 3))
+    return {
+        "active_users": _state["active_users"],
+        "as_of": now_iso(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/top-products?limit=5
+# ---------------------------------------------------------------------------
+@app.get("/api/top-products")
+def get_top_products(limit: int = 5):
+    return {"top_products": _products[:limit]}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/user-activity?product_id=P-2003
+# ---------------------------------------------------------------------------
+@app.get("/api/user-activity")
+def get_user_activity(product_id: str):
+    clicks = random.randint(200, 400)
+    orders = random.randint(10, 30)
+    return {
+        "product_id": product_id,
+        "clicks_today": clicks,
+        "orders_today": orders,
+        "conversion_rate": round(orders / clicks, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/recommendations?product_id=P-2003
+# ---------------------------------------------------------------------------
+@app.get("/api/recommendations")
+def get_recommendations(product_id: str):
+    pool = [pid for pid in _product_names if pid != product_id]
+    picks = random.sample(pool, k=min(2, len(pool)))
+    also_bought = [
+        {
+            "product_id": pid,
+            "name": _product_names[pid],
+            "strength": random.randint(10, 40),
+        }
+        for pid in picks
+    ]
+    return {"product_id": product_id, "also_bought": also_bought}
+
+
+# ---------------------------------------------------------------------------
+# WS /ws/live-updates
+# Pushes a "new_order" event every few seconds, matching the contract shape.
+# ---------------------------------------------------------------------------
+@app.websocket("/ws/live-updates")
+async def live_updates(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            await asyncio.sleep(3)  # tune this for demo pacing
+            _state["revenue_today"] += random.uniform(100, 900)
+            _state["orders_today"] += 1
+            _state["active_users"] = max(0, _state["active_users"] + random.randint(-1, 2))
+
+            await websocket.send_json(
+                {
+                    "event": "new_order",
+                    "revenue_today": round(_state["revenue_today"], 2),
+                    "orders_today": _state["orders_today"],
+                    "active_users": _state["active_users"],
+                }
+            )
+    except WebSocketDisconnect:
+        pass
